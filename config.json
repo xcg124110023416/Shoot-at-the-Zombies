@@ -1,9 +1,22 @@
 {
+  "game_title": "抖音",
+  "mode": "环球",
+  "rich_mode": 1,
+  "battle_count": 0,
+  "battle_time": 0,
   "priority_skills": [
     "子弹",
     "温压弹",
-    "干冰弹",
     "电",
-    "冰雹"
+    "激光",
+    ""
+  ],
+  "target_huanqiu_levels": [
+    13,
+    16,
+    17,
+    18,
+    19,
+    20
   ]
 }
