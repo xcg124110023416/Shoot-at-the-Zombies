@@ -290,13 +290,18 @@ class GameBot:
         }
         print(f"像素采样初始化完成: 模板尺寸 {tw}x{th}, 采样点 {len(sample_offsets)} 个")
 
-    def _fast_find_huanqiu(self, img):
+    def _fast_find_huanqiu(self, img, offset_x=0, offset_y=0):
         """使用像素采样快速查找所有环球按钮位置（替代matchTemplate，快~50倍）
         
         原理：
         1. 用numpy向量化操作，在全图扫描2个参考像素做快速初筛
         2. 对少量候选位置，用剩余5个采样点验证
         3. 合并距离过近的重复匹配
+        
+        参数：
+            img: 输入图像（可以是完整截图或裁剪后的ROI）
+            offset_x: 图像左上角相对于完整截图的x偏移（用于修正返回的绝对坐标）
+            offset_y: 图像左上角相对于完整截图的y偏移（用于修正返回的绝对坐标）
         """
         if self._huanqiu_pixels is None:
             return self._find_all_templates_in_image(img, "huanqiu.png")
@@ -347,8 +352,8 @@ class GameBot:
                     valid = False
                     break
             if valid:
-                center_x = self.game_window[0] + x + tw // 2
-                center_y = self.game_window[1] + y + th // 2
+                center_x = self.game_window[0] + offset_x + x + tw // 2
+                center_y = self.game_window[1] + offset_y + y + th // 2
                 matches.append((center_x, center_y))
         
         # 去重：合并距离过近的匹配点
@@ -484,7 +489,7 @@ class GameBot:
         4. 进队快速判断 - 一旦进队立即检测是否目标环，快速决策
         5. 定期轻量检查 - 重连等不频繁检查
         """
-        # self._init_pixel_samples()  # 已废弃，现改用缓存坐标连点器模式
+        self._init_pixel_samples()  # 初始化像素采样点，用于快速查找环球按钮
         grab_count = 0
         in_recruitment_page = False
         
@@ -548,6 +553,8 @@ class GameBot:
                     if max_val > best_score and max_val >= 0.90:  # 基础阈值0.9
                         best_score = max_val
                         best_level = level
+                        if max_val >= 0.99:  # 极高置信度，提前退出
+                            break
                 
                 target_level = None
                 if best_level in self.target_huanqiu_levels:
@@ -569,9 +576,9 @@ class GameBot:
                             break
                     if exit_pos:
                         self.click_fast(*exit_pos)
-                        # 等待确认弹窗出现，多次尝试找sure按钮 (增加到20次，防止弹窗太慢)
-                        for _ in range(20):
-                            time.sleep(0.1)  # 必须有等待！否则瞬间循环完，游戏还没弹出框
+                        # 等待确认弹窗出现，多次尝试找sure按钮 (前10次快速检查，后10次正常速度)
+                        for i in range(20):
+                            time.sleep(0.05 if i < 10 else 0.1)  # 前10次0.05s快速检查，后10次0.1s
                             with self._img_lock:
                                 sure_img = self._latest_img
                             if sure_img is not None:
@@ -584,7 +591,7 @@ class GameBot:
                                     # 修正相对坐标到绝对坐标
                                     sure_pos_abs = (sure_pos[0], sure_pos[1] + offset_y_sure)
                                     self.click_fast(*sure_pos_abs)
-                                    time.sleep(1.5)  # 点击确认后，等待游戏彻底退出队伍画面（过场时间）
+                                    time.sleep(1.0)  # 点击确认后，等待游戏彻底退出队伍画面（过场时间）
                                     break
                     else:
                         time.sleep(0.2)  # 没找到退出按钮也等一下，防止疯狂刷屏
@@ -606,7 +613,7 @@ class GameBot:
                 
                 print("当前队伍符合要求，等待队长开始战斗...")
                 self._was_in_team = True  # 记录状态：我们刚才在队伍里
-                time.sleep(1)
+                time.sleep(0.3)  # 从1s降到0.3s，更快响应战斗开始
                 continue
             
             # ========== 极速连点通道（短路逻辑） ==========
@@ -617,28 +624,25 @@ class GameBot:
                     h_huanqiu, w_huanqiu = img.shape[:2]
                     offset_y_huanqiu = h_huanqiu // 4
                     roi_huanqiu = img[offset_y_huanqiu:5*h_huanqiu//6, 0:w_huanqiu]
-                    raw_positions = self._find_all_templates_in_image(roi_huanqiu, "huanqiu.png", threshold=0.8)
-                    positions = [(p[0], p[1] + offset_y_huanqiu) for p in raw_positions] if raw_positions else []
-                    if positions:
+                    raw_positions = self._fast_find_huanqiu(roi_huanqiu, offset_x=0, offset_y=offset_y_huanqiu)
+                    if raw_positions:
                         # 找到所有位置中 y 坐标最大的（最下面的那个环）
-                        bottom_pos = max(positions, key=lambda p: p[1])
+                        bottom_pos = max(raw_positions, key=lambda p: p[1])
                         self._cached_join_pos = bottom_pos
                         print(f"锁定最下方坑位坐标: {bottom_pos}，开启连点模式！")
                 
                 if getattr(self, '_cached_join_pos', None):
-                    # 极速微循环爆点
-                    for _ in range(5):
-                        self.click_fast(*self._cached_join_pos)
+                    # 极速微循环爆点（10次连点）
+                    cx, cy = self._cached_join_pos
+                    for _ in range(10):
+                        self.click_fast(cx, cy)
                     
                     grab_count += 1
-                    # 定期轻量检查
-                    if grab_count % 200 == 0:
+                    # 定期轻量检查：确认是否还在招募页面
+                    if grab_count % 500 == 0:
                         with self._img_lock:
                             check_img = self._latest_img
                         if check_img is not None:
-                            reconnect_pos = self._find_template_in_image(check_img, "reconnection.png")
-                            if reconnect_pos:
-                                self.click_fast(*reconnect_pos)
                             h_check, w_check = check_img.shape[:2]
                             roi_recruit = check_img[h_check//4:h_check//2, 0:w_check]
                             if not self._find_template_in_image(roi_recruit, "recruitment-1.png"):
@@ -654,8 +658,19 @@ class GameBot:
             # 如果刚刚还在队伍里，现在突然不在了，说明正在加载进战斗（或者被踢了）
             if getattr(self, '_was_in_team', False):
                 print("检测到离开队伍，等待游戏过场动画（加载战斗或回主城）...")
-                time.sleep(2.0)  # 给足够的时间让战斗画面或主城画面加载出来
                 self._was_in_team = False
+                # 渐进式等待：每0.5s检测画面是否加载完成，最多等4秒
+                for _ in range(8):
+                    time.sleep(0.5)
+                    with self._img_lock:
+                        check_img = self._latest_img
+                    if check_img is not None:
+                        h, w = check_img.shape[:2]
+                        roi_check = check_img[h//4:h//2, 0:w]
+                        if (self._find_template_in_image(roi_check, "recruitment-1.png") or
+                            self._find_template_in_image(check_img, "battling-2.png") or
+                            self._find_template_in_image(check_img, "battling-3.png")):
+                            break  # 画面已加载完成，立即继续
                 continue  # 让下一个循环用最新画面重新判断
                 
             # 检测是否在战斗中（战斗相关UI在画面的 1/3 到 2/3 之间）
