@@ -481,13 +481,16 @@ class GameBot:
 
     def _poor_mode_loop(self):
         """穷B模式专用主循环
-        
-        核心设计：
-        1. 抢环优先 - 绝大部分时间用于快速抢环，不做无关检测
-        2. 单截图复用 - 同一张截图同时检测队伍状态和环球按钮，减半截图开销
-        3. 招募页面一次性进入 - 确认在招募页面后不再重复检测
-        4. 进队快速判断 - 一旦进队立即检测是否目标环，快速决策
-        5. 定期轻量检查 - 重连等不频繁检查
+
+        三线程架构：
+        1. 截图线程（~25fps）：持续截图，主线程只读最新帧，不阻塞
+        2. 检测线程：状态驱动，只做必要的模板匹配（cv2释放GIL，不阻塞主线程）
+           - 招募页：只检测是否进队（1次matchTemplate，~20ms）
+           - 队伍中：只检测是否开战（1-3次matchTemplate，~20-60ms）
+           - 战斗中：不检测，等主线程通知重置
+        3. 主线程连点循环（~100μs/轮）：读共享状态 + 10次连点，无模板匹配开销
+
+        主流程：进队 → 识别环等级 → 坏环退出/好环等队长 → 战斗 → 离队 → 回招募页连点
         """
         self._init_pixel_samples()  # 初始化像素采样点，用于快速查找环球按钮
         grab_count = 0
@@ -507,7 +510,103 @@ class GameBot:
         
         screenshot_thread = threading.Thread(target=_screenshot_loop, daemon=True)
         screenshot_thread.start()
-        
+
+        # 检测线程：每100ms做一次模板匹配，更新共享状态（利用cv2释放GIL的特性）
+        self._state_in_team = False
+        self._state_in_recruit = False
+        self._state_in_battle = False
+        self._state_lock = threading.Lock()
+        self._detection_reset = False  # 主线程通知检测线程重置状态
+
+        def _detection_loop():
+            prev_state = 'unknown'  # 上一次的状态，用于跳过不必要的检测
+            while self.running:
+                if not self.game_window:
+                    time.sleep(0.5)
+                    continue
+                with self._img_lock:
+                    det_img = self._latest_img
+                if det_img is None:
+                    time.sleep(0.1)
+                    continue
+                h, w = det_img.shape[:2]
+
+                # 主线程通知重置（战斗结束等状态切换）
+                if self._detection_reset:
+                    self._detection_reset = False
+                    prev_state = 'unknown'
+
+                # 根据上一次状态，只做必要的检测
+                if prev_state == 'recruit':
+                    # 在招募页：只检测是否进队（最常见路径，只做1次matchTemplate）
+                    roi_top = det_img[h//6:h//4, w//5:4*w//5]
+                    if self._find_template_in_image(roi_top, "in-huanqiu-team.png"):
+                        with self._state_lock:
+                            self._state_in_team = True
+                            self._state_in_recruit = False
+                            self._state_in_battle = False
+                        prev_state = 'team'
+                    # else: 仍在招募页，不需要更新状态
+
+                elif prev_state == 'team':
+                    # 在队伍中：只检测是否开战（1-3次matchTemplate）
+                    roi_bt = det_img[h//3:2*h//3, 0:w]
+                    is_battle = False
+                    for tmpl in ['battling.png', 'battling-3.png', 'choose-skill.png']:
+                        if self._find_template_in_image(roi_bt, tmpl):
+                            is_battle = True
+                            break
+                    if is_battle:
+                        with self._state_lock:
+                            self._state_in_team = False
+                            self._state_in_recruit = False
+                            self._state_in_battle = True
+                        prev_state = 'battle'
+                    else:
+                        # 也检查是否离队（被踢了）
+                        roi_top = det_img[h//6:h//4, w//5:4*w//5]
+                        if not self._find_template_in_image(roi_top, "in-huanqiu-team.png"):
+                            with self._state_lock:
+                                self._state_in_team = False
+                            prev_state = 'unknown'
+
+                elif prev_state == 'battle':
+                    # 战斗中：什么都不检测，等主线程的_handle_battle()返回
+                    pass
+
+                else:
+                    # 未知状态（启动时）：做全量检测
+                    roi_top = det_img[h//6:h//4, w//5:4*w//5]
+                    if self._find_template_in_image(roi_top, "in-huanqiu-team.png"):
+                        with self._state_lock:
+                            self._state_in_team = True
+                            self._state_in_recruit = False
+                            self._state_in_battle = False
+                        prev_state = 'team'
+                    else:
+                        roi_rc = det_img[h//4:h//2, 0:w]
+                        if self._find_template_in_image(roi_rc, "recruitment-1.png"):
+                            with self._state_lock:
+                                self._state_in_team = False
+                                self._state_in_recruit = True
+                                self._state_in_battle = False
+                            prev_state = 'recruit'
+                        else:
+                            roi_bt = det_img[h//3:2*h//3, 0:w]
+                            is_battle = False
+                            for tmpl in ['battling.png', 'battling-3.png', 'choose-skill.png']:
+                                if self._find_template_in_image(roi_bt, tmpl):
+                                    is_battle = True
+                                    break
+                            with self._state_lock:
+                                self._state_in_team = False
+                                self._state_in_recruit = False
+                                self._state_in_battle = is_battle
+                            prev_state = 'battle' if is_battle else 'unknown'
+
+        det_thread = threading.Thread(target=_detection_loop, daemon=True)
+        det_thread.start()
+
         while self.running:
             # 确保游戏窗口存在
             if not self.game_window and not self.find_game_window():
@@ -521,17 +620,17 @@ class GameBot:
                 time.sleep(0.1)  # 等待第一帧截图
                 continue
             
-            # ========== 快速检测：是否已进入队伍（轻量，只做一次模板匹配） ==========
-            # 优化：队伍状态栏固定在屏幕上半部分，截取精确区间(ROI)能极大提升匹配速度
-            h, w = img.shape[:2]
-            roi_top = img[h//6:h//4, w//5:4*w//5]
-            in_team = self._find_template_in_image(roi_top, "in-huanqiu-team.png")
-            
+            # ========== 读取检测线程的共享状态（瞬间，不阻塞） ==========
+            with self._state_lock:
+                in_team = self._state_in_team
+                if not in_team:
+                    in_recruitment_page = self._state_in_recruit
+
             if in_team:
                 in_recruitment_page = False
                 self._cached_join_pos = None  # 清除连点缓存
                 grab_count = 0
-                
+
                 # 同一张截图检测当前到底是哪个环（找置信度最高的，防止3和6误判）
                 # 优化：因为"难度XX"必定在屏幕上半部分，截取精确区间(ROI)能提升数倍速度
                 best_level = None
@@ -545,12 +644,12 @@ class GameBot:
                     if template is None:
                         continue
                     # 确保模板不比ROI还大
-                    if template.shape[0] > roi_img.shape[0] or template.shape[1] > roi_img.shape[1]:
-                        continue
+                    # if template.shape[0] > roi_img.shape[0] or template.shape[1] > roi_img.shape[1]:
+                    #     continue
                         
                     result = cv2.matchTemplate(roi_img, template, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, _ = cv2.minMaxLoc(result)
-                    if max_val > best_score and max_val >= 0.90:  # 基础阈值0.9
+                    if max_val > best_score and max_val >= 0.95:  # 基础阈值0.9
                         best_score = max_val
                         best_level = level
                         if max_val >= 0.99:  # 极高置信度，提前退出
@@ -609,6 +708,10 @@ class GameBot:
                 
                 if is_battling:
                     self._handle_battle()
+                    with self._state_lock:
+                        self._state_in_team = False
+                        self._state_in_battle = False
+                    self._detection_reset = True  # 通知检测线程重置状态
                     continue
                 
                 print("当前队伍符合要求，等待队长开始战斗...")
@@ -617,8 +720,16 @@ class GameBot:
                 continue
             
             # ========== 极速连点通道（短路逻辑） ==========
-            # 只要处于招募页面，直接走捷径，完全绕开下面的“是否在战斗”检测！
+            # 只要处于招募页面，直接走捷径，完全绕开下面的”是否在战斗”检测！
             if in_recruitment_page:
+                # 读取检测线程状态：每10次迭代检查一次，利用cv2释放GIL的特性，开销~0
+                if grab_count % 10 == 0:
+                    with self._state_lock:
+                        if self._state_in_team or self._state_in_battle or not self._state_in_recruit:
+                            in_recruitment_page = False
+                            self._cached_join_pos = None
+                            continue
+
                 if getattr(self, '_cached_join_pos', None) is None:
                     # 优化：招募坑位必定在画面 1/4 到 5/6 之间
                     h_huanqiu, w_huanqiu = img.shape[:2]
@@ -630,26 +741,14 @@ class GameBot:
                         bottom_pos = max(raw_positions, key=lambda p: p[1])
                         self._cached_join_pos = bottom_pos
                         print(f"锁定最下方坑位坐标: {bottom_pos}，开启连点模式！")
-                
+
                 if getattr(self, '_cached_join_pos', None):
                     # 极速微循环爆点（10次连点）
                     cx, cy = self._cached_join_pos
                     for _ in range(10):
                         self.click_fast(cx, cy)
-                    
+
                     grab_count += 1
-                    # 定期轻量检查：确认是否还在招募页面
-                    if grab_count % 500 == 0:
-                        with self._img_lock:
-                            check_img = self._latest_img
-                        if check_img is not None:
-                            h_check, w_check = check_img.shape[:2]
-                            roi_recruit = check_img[h_check//4:h_check//2, 0:w_check]
-                            if not self._find_template_in_image(roi_recruit, "recruitment-1.png"):
-                                in_recruitment_page = False
-                                self._cached_join_pos = None  # 清除连点缓存
-                                print("检测到已离开招募页面，等待画面加载...")
-                                time.sleep(0.5)
                     # ★★★ 核心：直接进入下一帧，跳过所有的战斗和页面跳转检测！ ★★★
                     continue
             
@@ -667,52 +766,74 @@ class GameBot:
                     if check_img is not None:
                         h, w = check_img.shape[:2]
                         roi_check = check_img[h//4:h//2, 0:w]
-                        if (self._find_template_in_image(roi_check, "recruitment-1.png") or
-                            self._find_template_in_image(check_img, "battling-2.png") or
-                            self._find_template_in_image(check_img, "battling-3.png")):
-                            break  # 画面已加载完成，立即继续
-                continue  # 让下一个循环用最新画面重新判断
+                        if self._find_template_in_image(roi_check, "recruitment-1.png"):
+                            break  # 回到招募页，立即继续
+                        if any(self._find_template_in_image(check_img, t) for t in
+                               ['battling.png', 'battling-2.png', 'battling-3.png', 'choose-skill.png']):
+                            self._handle_battle()  # 检测到战斗，直接处理
+                            # 清除检测线程的战斗状态，防止主循环下一轮重复读到True再次调用
+                            with self._state_lock:
+                                self._state_in_battle = False
+                            self._detection_reset = True
+                            break
+                continue
                 
-            # 检测是否在战斗中（战斗相关UI在画面的 1/3 到 2/3 之间）
-            is_battling = False
-            h_bat2, w_bat2 = img.shape[:2]
-            roi_battling2 = img[h_bat2//3:h_bat2//2, 0:w_bat2]
-            for tmpl in ['battling-2.png', 'battling-3.png', 'choose-skill.png', 'choose-skill-1.png']:
-                if self._find_template_in_image(roi_battling2, tmpl):
-                    is_battling = True
-                    break
+            # 读取检测线程的战斗状态（瞬间，不阻塞）
+            with self._state_lock:
+                is_battling = self._state_in_battle
             if is_battling:
                 in_recruitment_page = False
                 self._cached_join_pos = None  # 清除连点缓存
                 self._handle_battle()
+                with self._state_lock:
+                    self._state_in_battle = False
+                self._detection_reset = True  # 通知检测线程重置状态
                 continue
             
             # 首次或离开队伍后，需要确保进入招募页面（一次性操作）
             if not in_recruitment_page:
-                on_recruit = self._find_template_in_image(img, "recruitment-1.png")
-                if on_recruit:
+                # 快速检测：如果已经在招募页，直接设置状态，避免误点其他按钮
+                h_nav, w_nav = img.shape[:2]
+                roi_rc_nav = img[h_nav//4:h_nav//2, 0:w_nav]
+                if self._find_template_in_image(roi_rc_nav, "recruitment-1.png"):
+                    with self._state_lock:
+                        self._state_in_recruit = True
                     in_recruitment_page = True
-                else:
-                    # 尝试进入招募页面
-                    recruit_btn = self._find_template_in_image(img, "recruitment.png")
-                    if recruit_btn:
-                        self.click(*recruit_btn)
-                        time.sleep(0.5)  # 等待页面切换动画
-                    else:
-                        im_btn = self._find_template_in_image(img, "im.png")
-                        if im_btn:
-                            self.click(*im_btn)
-                            time.sleep(0.8)  # 等待聊天窗口弹出动画
-                        else:
-                            # 找不到im和招募，可能在其他页面
-                            # 优先尝试点击战斗按钮切回主界面（主界面有im入口）
-                            for btn in ["battle.png", "battle-1.png"]:
-                                pos = self._find_template_in_image(img, btn)
-                                if pos:
-                                    self.click(*pos)
-                                    time.sleep(0.5)  # 等待切回主界面动画
-                                    break
                     continue
+
+                # 先检查是否在战斗中（防止启动时在战斗页面却去点im.png）
+                roi_bt_nav = img[h_nav//3:2*h_nav//3, 0:w_nav]
+                in_battle_now = False
+                for tmpl in ['battling.png', 'battling-3.png', 'choose-skill.png']:
+                    if self._find_template_in_image(roi_bt_nav, tmpl):
+                        in_battle_now = True
+                        break
+                if in_battle_now:
+                    self._handle_battle()
+                    with self._state_lock:
+                        self._state_in_battle = False
+                    self._detection_reset = True
+                    continue
+
+                recruit_btn = self._find_template_in_image(img, "recruitment.png")
+                if recruit_btn:
+                    self.click(*recruit_btn)
+                    time.sleep(0.5)  # 等待页面切换动画
+                else:
+                    im_btn = self._find_template_in_image(img, "im.png")
+                    if im_btn:
+                        self.click(*im_btn)
+                        time.sleep(0.8)  # 等待聊天窗口弹出动画
+                    else:
+                        # 找不到im和招募，可能在其他页面
+                        # 优先尝试点击战斗按钮切回主界面（主界面有im入口）
+                        for btn in ["battle.png", "battle-1.png"]:
+                            pos = self._find_template_in_image(img, btn)
+                            if pos:
+                                self.click(*pos)
+                                time.sleep(0.5)  # 等待切回主界面动画
+                                break
+                continue
             
 
     def find_in_huanqiu_team(self):
