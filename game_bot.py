@@ -801,6 +801,13 @@ class GameBot:
                     in_recruitment_page = True
                     continue
 
+                # 快速检测：如果已经在队伍中，直接设置状态，避免误点im.png
+                roi_team_nav = img[h_nav//6:h_nav//4, w_nav//5:4*w_nav//5]
+                if self._find_template_in_image(roi_team_nav, "in-huanqiu-team.png"):
+                    with self._state_lock:
+                        self._state_in_team = True
+                    continue
+
                 # 先检查是否在战斗中（防止启动时在战斗页面却去点im.png）
                 roi_bt_nav = img[h_nav//3:2*h_nav//3, 0:w_nav]
                 in_battle_now = False
