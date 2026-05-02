@@ -551,12 +551,7 @@ class GameBot:
                 elif prev_state == 'team':
                     # 在队伍中：只检测是否开战（1-3次matchTemplate）
                     roi_bt = det_img[h//3:2*h//3, 0:w]
-                    is_battle = False
-                    for tmpl in ['battling.png', 'battling-3.png', 'choose-skill.png']:
-                        if self._find_template_in_image(roi_bt, tmpl):
-                            is_battle = True
-                            break
-                    if is_battle:
+                    if self._find_template_in_image(roi_bt, "battling.png"):
                         with self._state_lock:
                             self._state_in_team = False
                             self._state_in_recruit = False
@@ -593,11 +588,7 @@ class GameBot:
                             prev_state = 'recruit'
                         else:
                             roi_bt = det_img[h//3:2*h//3, 0:w]
-                            is_battle = False
-                            for tmpl in ['battling.png', 'battling-3.png', 'choose-skill.png']:
-                                if self._find_template_in_image(roi_bt, tmpl):
-                                    is_battle = True
-                                    break
+                            is_battle = self._find_template_in_image(roi_bt, "battling.png")
                             with self._state_lock:
                                 self._state_in_team = False
                                 self._state_in_recruit = False
@@ -701,10 +692,8 @@ class GameBot:
                 is_battling = False
                 h_bat, w_bat = img.shape[:2]
                 roi_battling = img[h_bat//3:2*h_bat//3, 0:w_bat]
-                for tmpl in ['battling.png', 'battling-3.png', 'choose-skill.png']:
-                    if self._find_template_in_image(roi_battling, tmpl):
-                        is_battling = True
-                        break
+                if self._find_template_in_image(roi_battling, "battling.png"):
+                    is_battling = True
                 
                 if is_battling:
                     self._handle_battle()
@@ -768,8 +757,7 @@ class GameBot:
                         roi_check = check_img[h//4:h//2, 0:w]
                         if self._find_template_in_image(roi_check, "recruitment-1.png"):
                             break  # 回到招募页，立即继续
-                        if any(self._find_template_in_image(check_img, t) for t in
-                               ['battling.png', 'battling-2.png', 'battling-3.png', 'choose-skill.png']):
+                        if self._find_template_in_image(check_img, "battling.png"):
                             self._handle_battle()  # 检测到战斗，直接处理
                             # 清除检测线程的战斗状态，防止主循环下一轮重复读到True再次调用
                             with self._state_lock:
@@ -810,11 +798,7 @@ class GameBot:
 
                 # 先检查是否在战斗中（防止启动时在战斗页面却去点im.png）
                 roi_bt_nav = img[h_nav//3:2*h_nav//3, 0:w_nav]
-                in_battle_now = False
-                for tmpl in ['battling.png', 'battling-3.png', 'choose-skill.png']:
-                    if self._find_template_in_image(roi_bt_nav, tmpl):
-                        in_battle_now = True
-                        break
+                in_battle_now = self._find_template_in_image(roi_bt_nav, "battling.png")
                 if in_battle_now:
                     self._handle_battle()
                     with self._state_lock:
@@ -1425,14 +1409,43 @@ class GameBot:
                 # self.click(500, 100)
                 # timestamp = time.time()
 
+class TextRedirector:
+    """将print输出重定向到Tkinter Text控件（线程安全）"""
+    def __init__(self, text_widget, root, original_stdout):
+        self.text_widget = text_widget
+        self.root = root
+        self.original_stdout = original_stdout
+        self._buf = ""
+
+    def write(self, s):
+        self.original_stdout.write(s)
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                self.root.after(0, self._append, line)
+
+    def _append(self, s):
+        self.text_widget.config(state=tk.NORMAL)
+        self.text_widget.insert(tk.END, s + "\n")
+        if int(self.text_widget.index('end-1c').split('.')[0]) > 500:
+            self.text_widget.delete('1.0', '301.0')
+        self.text_widget.see(tk.END)
+        self.text_widget.config(state=tk.DISABLED)
+
+    def flush(self):
+        self.original_stdout.flush()
+
+
 class GameBotGUI:
     CONFIG_FILE = "config.json"
     
     def __init__(self, root):
         self.root = root
         self.root.title("游戏机器人操作界面")
-        self.root.geometry("680x700")
+        self.root.geometry("700x950")
         self.root.resizable(False, False)
+        self.root.grid_rowconfigure(16, weight=1)  # 底部弹性空间，把日志区往上推
         
         self.bot = None
         self.is_running = False
@@ -1603,6 +1616,15 @@ class GameBotGUI:
         
         # 提示标签
         ttk.Label(self.root, text="提示: 按ESC键暂停脚本", foreground="blue").grid(row=14, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W)
+
+        # 日志区域
+        log_frame = ttk.LabelFrame(self.root, text="运行日志")
+        log_frame.grid(row=15, column=0, columnspan=3, padx=10, pady=(5, 100), sticky=tk.EW)
+        self.log_text = tk.Text(log_frame, height=8, width=80, state=tk.DISABLED, font=("Consolas", 9))
+        log_scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
     
     def on_skill_selected(self, event):
         """技能选择事件，防止重复选择"""
@@ -1693,14 +1715,31 @@ class GameBotGUI:
                 checkbutton.config(state=tk.DISABLED)
             self.resize_btn.config(state=tk.DISABLED)
             
+            # 重定向stdout到日志区域
+            self._original_stdout = sys.stdout
+            sys.stdout = TextRedirector(self.log_text, self.root, self._original_stdout)
+
+            # 清空日志
+            self.log_text.config(state=tk.NORMAL)
+            self.log_text.delete(1.0, tk.END)
+            self.log_text.config(state=tk.DISABLED)
+
             # 创建并启动线程
             self.bot_thread = threading.Thread(target=self.run_bot, daemon=True)
             self.bot_thread.start()
+
+            # 每50ms刷新一次日志，让GUI跟上终端输出
+            self._flush_log()
             
         except Exception as e:
             messagebox.showerror("错误", f"启动失败: {str(e)}")
             self.status_var.set("就绪")
     
+    def _flush_log(self):
+        """定时刷新日志到GUI"""
+        self.root.update_idletasks()
+        self._flush_timer = self.root.after(50, self._flush_log)
+
     def run_bot(self):
         """运行游戏机器人主循环"""
         try:
@@ -1718,6 +1757,17 @@ class GameBotGUI:
     
     def stop_bot(self):
         """停止游戏机器人"""
+        # 停止日志刷新定时器
+        if hasattr(self, '_flush_timer'):
+            self.root.after_cancel(self._flush_timer)
+
+        # 把排队中的GUI日志回调刷完
+        self.root.update_idletasks()
+
+        # 恢复stdout
+        if hasattr(self, '_original_stdout'):
+            sys.stdout = self._original_stdout
+
         if self.bot:
             self.bot.running = False
             self.bot = None
