@@ -55,3 +55,12 @@ No automated test framework, linter, or CI is configured.
 - Templates are resolution-sensitive; re-capture if window size changes
 - Python GIL: `cv2.matchTemplate` releases GIL during C++ execution (enables true parallelism in detection thread); numpy operations do not release GIL
 - All user-facing text and docs are in Chinese
+
+日志与注释：所有新增的逻辑必须用中文写清楚注释；关键的状态切换（如进队、战斗）必须保留或增加清晰的 print 终端输出。
+
+## Coding Guidelines
+
+1. **先想再写** — 不要假设，不确定就问；有多种方案就都列出来，不要自己默默选一个。
+2. **简洁优先** — 最少代码解决问题，不做多余的抽象、配置化、错误处理。如果 50 行能搞定就别写 200 行。
+3. **最小改动** — 只改必须改的，不顺手"优化"无关代码。改完后清理自己引入的无用代码，不动已有的。
+4. **目标驱动** — 改之前先定义验证方式，改完确认通过再结束。
